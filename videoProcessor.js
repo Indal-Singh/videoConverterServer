@@ -88,11 +88,14 @@ async function processVideoFromS3Url(s3Url) {
             ffmpeg(inputTmp)
                 .videoCodec('libx264')
                 .size('854x480') // 16:9 aspect ratio at 480p
+                .audioBitrate('128k')
                 .outputOptions([
                     '-preset fast',
                     '-crf 23',
                     '-movflags +faststart' // Optimize for web streaming
                 ])
+                .videoBitrate('350k') // OR .videoBitrate(350) – both work
+                .audioBitrate('64k') // OR .audioBitrate(64)
                 .on('error', (err) => {
                     console.error('FFmpeg error:', err);
                     reject(err);
