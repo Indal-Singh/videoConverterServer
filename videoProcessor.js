@@ -6,6 +6,7 @@ const ffmpeg = require('fluent-ffmpeg');
 const ffmpegStatic = require('ffmpeg-static');
 require('dotenv').config(); // Load environment variables from .env file
 
+
 const {
     Upload
 } = require('@aws-sdk/lib-storage');
@@ -86,12 +87,11 @@ async function processVideoFromS3Url(s3Url) {
         await new Promise((resolve, reject) => {
             ffmpeg(inputTmp)
                 .videoCodec('libx264')
-                .videoBitrate(350)
-                .audioBitrate(64)
+                .size('854x480') // 16:9 aspect ratio at 480p
                 .outputOptions([
-                    '-crf 28',
-                    '-preset slow',
-                    '-movflags +faststart', // Optimize for web streaming
+                    '-preset fast',
+                    '-crf 23',
+                    '-movflags +faststart' // Optimize for web streaming
                 ])
                 .on('error', (err) => {
                     console.error('FFmpeg error:', err);
@@ -119,7 +119,7 @@ async function processVideoFromS3Url(s3Url) {
                 Key: newKey,
                 Body: fileStream,
                 ContentType: 'video/mp4',
-                ContentLength: fileStats.size
+                ContentLength: fileStats.size,
             }
         }).done();
 
