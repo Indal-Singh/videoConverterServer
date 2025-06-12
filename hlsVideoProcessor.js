@@ -36,7 +36,7 @@ const QUALITY_CONFIGS = [
     { name: '1080p', width: 1920, height: 1080, videoBitrate: '5000k', audioBitrate: '192k' }
 ];
 
-async function processVideoToHLS(s3Url, savePath) {
+async function processVideoToHLS(s3Url, savePath, reelId) {
     console.log(`Starting HLS video processing for: ${s3Url}`);
     
     const url = new URL(s3Url);
@@ -175,13 +175,13 @@ async function processVideoToHLS(s3Url, savePath) {
         };
 
     } catch (error) {
-        console.error('Error processing video:', error);
-        throw error;
         // update main server video status to failed
         await axios.post(`${process.env.MAIN_SERVER_URL}/reels/internal/update`, {
             reelId: reelId,
-            status: 'failed'
+            video_proccessed_status: 'failed'
         });
+        console.error('Error processing video:', error);
+        throw error;
     } finally {
         // Cleanup all temporary files and directories
         try {
@@ -204,14 +204,14 @@ async function processVideoToHLS(s3Url, savePath) {
             // update main server video status to completed
             await axios.post(`${process.env.MAIN_SERVER_URL}/reels/internal/update`, {
                 reelId: reelId,
-                status: 'done'
+                video_proccessed_status: 'done'
             });
         } catch (cleanupError) {
             console.error('Error during cleanup:', cleanupError);
             // update main server video status to failed
             await axios.post(`${process.env.MAIN_SERVER_URL}/reels/internal/update`, {
                 reelId: reelId,
-                status: 'failed'
+                video_proccessed_status: 'failed'
             });
         }
     }
