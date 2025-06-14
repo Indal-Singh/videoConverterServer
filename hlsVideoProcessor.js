@@ -7,6 +7,7 @@ const tmp = require('tmp');
 const axios = require('axios');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegStatic = require('ffmpeg-static');
+const Logger = require('./utils/logger');
 require('dotenv').config();
 
 const {
@@ -30,19 +31,23 @@ const s3 = new S3({
 
 // Video quality configurations
 const QUALITY_CONFIGS = [
-    { name: '360p', width: 640, height: 360, videoBitrate: '500k', audioBitrate: '64k' },
-    { name: '480p', width: 854, height: 480, videoBitrate: '800k', audioBitrate: '96k' },
-    { name: '720p', width: 1280, height: 720, videoBitrate: '2500k', audioBitrate: '128k' },
-    { name: '1080p', width: 1920, height: 1080, videoBitrate: '5000k', audioBitrate: '192k' }
+    { name: '360p', maxHeight: 360, videoBitrate: '500k', audioBitrate: '64k' },
+    { name: '480p', maxHeight: 480, videoBitrate: '800k', audioBitrate: '96k' },
+    { name: '720p', maxHeight: 720, videoBitrate: '2500k', audioBitrate: '128k' },
+    { name: '1080p', maxHeight: 1080, videoBitrate: '5000k', audioBitrate: '192k' }
 ];
 
 async function processVideoToHLS(s3Url, savePath, reelId) {
-    console.log(`Starting HLS video processing for: ${s3Url}`);
-    
     const url = new URL(s3Url);
     const bucket = url.hostname.split('.')[0];
     const key = decodeURIComponent(url.pathname.slice(1));
     const baseName = path.basename(key, path.extname(key));
+    
+    // Initialize logger
+    const logger = new Logger(baseName);
+    await logger.initialize();
+    
+    logger.info(`Starting HLS video processing for: ${s3Url}`);
     
     // Create temporary directory for processing
     const tmpDir = tmp.dirSync({ unsafeCleanup: true });
@@ -54,7 +59,7 @@ async function processVideoToHLS(s3Url, savePath, reelId) {
         await fs.ensureDir(outputDir);
         
         // Download video from S3
-        console.log('Downloading video from S3...');
+        logger.info('Downloading video from S3...');
         const response = await axios({
             method: 'get',
             url: s3Url,
@@ -69,8 +74,16 @@ async function processVideoToHLS(s3Url, savePath, reelId) {
             writer.on('error', reject);
         });
 
+        // Get video information
+        const videoInfo = await getVideoInfo(inputTmp);
+        logger.info('Original video information:', videoInfo);
+
+        // Calculate aspect ratio
+        const aspectRatio = videoInfo.width / videoInfo.height;
+        // console.log('Video aspect ratio:', aspectRatio);
+
         // Generate thumbnail
-        console.log('Generating thumbnail...');
+        logger.info('Generating thumbnail...');
         const thumbnailPath = path.join(outputDir, 'thumbnail.jpg');
         await new Promise((resolve, reject) => {
             ffmpeg(inputTmp)
@@ -93,15 +106,26 @@ async function processVideoToHLS(s3Url, savePath, reelId) {
 
         // Process each quality
         for (const config of QUALITY_CONFIGS) {
-            console.log(`Processing ${config.name} quality...`);
+            logger.info(`Processing ${config.name} quality...`);
             const outputDir = qualityDirs[config.name];
             const outputPath = path.join(outputDir, `${baseName}_${config.name}.mp4`);
+
+            // Calculate dimensions maintaining aspect ratio
+            let targetHeight = config.maxHeight;
+            let targetWidth = Math.round(targetHeight * aspectRatio);
+
+            // Ensure width is even (required by some codecs)
+            if (targetWidth % 2 !== 0) {
+                targetWidth += 1;
+            }
+
+            logger.info(`Target dimensions for ${config.name}: ${targetWidth}x${targetHeight}`);
 
             // Convert video to specific quality
             await new Promise((resolve, reject) => {
                 ffmpeg(inputTmp)
                     .videoCodec('libx264')
-                    .size(`${config.width}x${config.height}`)
+                    .size(`${targetWidth}x${targetHeight}`)
                     .videoBitrate(config.videoBitrate)
                     .audioBitrate(config.audioBitrate)
                     .outputOptions([
@@ -134,11 +158,11 @@ async function processVideoToHLS(s3Url, savePath, reelId) {
             
 
             try {
-                console.log('Running FFmpeg command:', ffmpegCmd);
+                logger.info('Running FFmpeg command:', ffmpegCmd);
                 await execAsync(ffmpegCmd);
-                console.log(`Created HLS segments for ${config.name}`);
+                logger.info(`Created HLS segments for ${config.name}`);
             } catch (error) {
-                console.error(`Error creating HLS segments for ${config.name}:`, error);
+                logger.error(`Error creating HLS segments for ${config.name}:`, error);
                 throw error;
             }
         }
@@ -153,9 +177,9 @@ async function processVideoToHLS(s3Url, savePath, reelId) {
                 Bucket: bucket,
                 Key: path.join(savePath, 'master.mpd')
             });
-            console.log('Deleted existing master.mpd file from S3');
+            logger.info('Deleted existing master.mpd file from S3');
         } catch (error) {
-            console.log('No existing master.mpd file to delete');
+            logger.info('No existing master.mpd file to delete');
         }
 
         // Upload all files to S3
@@ -163,7 +187,7 @@ async function processVideoToHLS(s3Url, savePath, reelId) {
 
         // Verify files before upload
         const files = await fs.readdir(outputDir, { recursive: true });
-        console.log('Files before upload:', files);
+        logger.info('Files before upload:', files);
 
         return {
             masterPlaylistUrl: `https://${bucket}.s3.amazonaws.com/${path.join(savePath, 'master.m3u8')}`,
@@ -180,39 +204,41 @@ async function processVideoToHLS(s3Url, savePath, reelId) {
             reelId: reelId,
             video_proccessed_status: 'failed'
         });
-        console.error('Error processing video:', error);
+        logger.error('Error processing video:', error);
         throw error;
     } finally {
         // Cleanup all temporary files and directories
         try {
-            console.log('Cleaning up temporary files...');
+            logger.info('Cleaning up temporary files...');
             // Remove input file
             if (fs.existsSync(inputTmp)) {
                 await fs.unlink(inputTmp);
-                console.log('Removed input file:', inputTmp);
+                logger.info('Removed input file:', inputTmp);
             }
             
             // Remove output directory and all its contents
             if (fs.existsSync(outputDir)) {
                 await fs.remove(outputDir);
-                console.log('Removed output directory:', outputDir);
+                logger.info('Removed output directory:', outputDir);
             }
             
             // Remove temporary directory
             tmpDir.removeCallback();
-            console.log('Removed temporary directory:', tmpDir.name);
+            logger.info('Removed temporary directory:', tmpDir.name);
             // update main server video status to completed
             await axios.post(`${process.env.MAIN_SERVER_URL}/reels/internal/update`, {
                 reelId: reelId,
                 video_proccessed_status: 'done'
             });
         } catch (cleanupError) {
-            console.error('Error during cleanup:', cleanupError);
+            logger.error('Error during cleanup:', cleanupError);
             // update main server video status to failed
             await axios.post(`${process.env.MAIN_SERVER_URL}/reels/internal/update`, {
                 reelId: reelId,
                 video_proccessed_status: 'failed'
             });
+        } finally {
+            await logger.end();
         }
     }
 }
@@ -220,11 +246,11 @@ async function processVideoToHLS(s3Url, savePath, reelId) {
 async function createMasterPlaylist(basePath, outputPath) {
     const playlistContent = `#EXTM3U
 #EXT-X-VERSION:3
-${QUALITY_CONFIGS.map(config => `#EXT-X-STREAM-INF:BANDWIDTH=${parseInt(config.videoBitrate) + parseInt(config.audioBitrate)},RESOLUTION=${config.width}x${config.height}
+${QUALITY_CONFIGS.map(config => `#EXT-X-STREAM-INF:BANDWIDTH=${parseInt(config.videoBitrate) + parseInt(config.audioBitrate)},RESOLUTION=${config.maxHeight}x${config.maxHeight}
 ${config.name}/segments/playlist.m3u8`).join('\n')}`;
 
-    console.log('Creating master playlist at:', outputPath);
-    console.log('Playlist content:', playlistContent);
+    logger.info('Creating master playlist at:', outputPath);
+    logger.info('Playlist content:', playlistContent);
     await fs.writeFile(outputPath, playlistContent);
 }
 
@@ -253,7 +279,7 @@ async function uploadToS3(localPath, bucket, s3Path) {
                 }
             }).done();
             
-            console.log(`Uploaded: ${s3Key}`);
+            logger.info(`Uploaded: ${s3Key}`);
         }
     }
 }
@@ -272,6 +298,32 @@ function getContentType(filename) {
         default:
             return 'application/octet-stream';
     }
+}
+
+// Helper function to get video information
+function getVideoInfo(filePath) {
+    return new Promise((resolve, reject) => {
+        ffmpeg.ffprobe(filePath, (err, metadata) => {
+            if (err) {
+                console.error('Error getting video info:', err);
+                return reject(err);
+            }
+            
+            const videoStream = metadata.streams.find(stream => stream.codec_type === 'video');
+            if (!videoStream) {
+                return reject(new Error('No video stream found'));
+            }
+            
+            resolve({
+                width: videoStream.width,
+                height: videoStream.height,
+                duration: videoStream.duration,
+                codec: videoStream.codec_name,
+                bitrate: videoStream.bit_rate,
+                frameRate: eval(videoStream.r_frame_rate)
+            });
+        });
+    });
 }
 
 module.exports = { processVideoToHLS }; 
