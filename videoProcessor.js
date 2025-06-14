@@ -1,19 +1,14 @@
-const fs = require('fs-extra');
-const path = require('path');
-const tmp = require('tmp');
-const axios = require('axios');
-const ffmpeg = require('fluent-ffmpeg');
-const ffmpegStatic = require('ffmpeg-static');
-require('dotenv').config(); // Load environment variables from .env file
+import fs from 'fs-extra';
+import path from 'path';
+import tmp from 'tmp';
+import axios from 'axios';
+import ffmpeg from 'fluent-ffmpeg';
+import ffmpegStatic from 'ffmpeg-static';
+import dotenv from 'dotenv';
+import { Upload } from '@aws-sdk/lib-storage';
+import { S3 } from '@aws-sdk/client-s3';
 
-
-const {
-    Upload
-} = require('@aws-sdk/lib-storage');
-
-const {
-    S3
-} = require('@aws-sdk/client-s3');
+dotenv.config();
 
 ffmpeg.setFfmpegPath(ffmpegStatic);
 
@@ -183,4 +178,4 @@ async function main() {
 // Uncomment to run directly
 // main();
 
-module.exports = { processVideoFromS3Url };
+export { processVideoFromS3Url };

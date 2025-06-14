@@ -1,6 +1,7 @@
 {
   "name": "videoconverterserver",
   "version": "1.0.0",
+  "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -11,8 +12,11 @@
   "description": "",
   "dependencies": {
     "@aws-sdk/lib-storage": "^3.806.0",
+    "@bull-board/api": "^5.23.0",
+    "@bull-board/express": "^5.23.0",
     "aws-sdk": "^2.1692.0",
     "axios": "^1.9.0",
+    "bullmq": "^5.1.1",
     "dotenv": "^16.5.0",
     "express": "^5.1.0",
     "ffmpeg-static": "^5.2.0",

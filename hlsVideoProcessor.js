@@ -1,22 +1,18 @@
-const fs = require('fs-extra');
-const path = require('path');
-const { exec } = require('child_process');
-const { promisify } = require('util');
+import fs from 'fs-extra';
+import path from 'path';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import tmp from 'tmp';
+import axios from 'axios';
+import ffmpeg from 'fluent-ffmpeg';
+import ffmpegStatic from 'ffmpeg-static';
+import Logger from './utils/logger.js';
+import dotenv from 'dotenv';
+import { Upload } from '@aws-sdk/lib-storage';
+import { S3 } from '@aws-sdk/client-s3';
+
 const execAsync = promisify(exec);
-const tmp = require('tmp');
-const axios = require('axios');
-const ffmpeg = require('fluent-ffmpeg');
-const ffmpegStatic = require('ffmpeg-static');
-const Logger = require('./utils/logger');
-require('dotenv').config();
-
-const {
-    Upload
-} = require('@aws-sdk/lib-storage');
-
-const {
-    S3
-} = require('@aws-sdk/client-s3');
+dotenv.config();
 
 ffmpeg.setFfmpegPath(ffmpegStatic);
 
@@ -37,6 +33,47 @@ const QUALITY_CONFIGS = [
     { name: '1080p', maxHeight: 1080, videoBitrate: '5000k', audioBitrate: '192k' }
 ];
 
+// Add axios retry configuration
+const axiosInstance = axios.create({
+    timeout: 30000, // 30 seconds timeout
+    maxContentLength: 50 * 1024 * 1024, // 50MB max content length
+    maxBodyLength: 50 * 1024 * 1024, // 50MB max body length
+    validateStatus: function (status) {
+        return status >= 200 && status < 300; // Only accept 2xx status codes
+    }
+});
+
+// Add retry interceptor
+axiosInstance.interceptors.response.use(null, async (error) => {
+    const config = error.config;
+    
+    // If no config or no retry count, initialize retry count
+    if (!config || !config.retryCount) {
+        config.retryCount = 0;
+    }
+    
+    // Maximum number of retries
+    const maxRetries = 3;
+    
+    if (config.retryCount < maxRetries) {
+        config.retryCount += 1;
+        
+        // Exponential backoff delay
+        const delay = Math.pow(2, config.retryCount) * 1000;
+        
+        // Log retry attempt
+        console.log(`Retrying request (${config.retryCount}/${maxRetries}) after ${delay}ms delay`);
+        
+        // Wait for the delay
+        await new Promise(resolve => setTimeout(resolve, delay));
+        
+        // Retry the request
+        return axiosInstance(config);
+    }
+    
+    return Promise.reject(error);
+});
+
 async function processVideoToHLS(s3Url, savePath, reelId) {
     const url = new URL(s3Url);
     const bucket = url.hostname.split('.')[0];
@@ -54,25 +91,34 @@ async function processVideoToHLS(s3Url, savePath, reelId) {
     const inputTmp = path.join(tmpDir.name, 'input' + path.extname(key));
     const outputDir = path.join(tmpDir.name, 'output');
     
+    let processingError = null;
+    
     try {
         // Create output directory
         await fs.ensureDir(outputDir);
         
-        // Download video from S3
+        // Download video from S3 with enhanced error handling
         logger.info('Downloading video from S3...');
-        const response = await axios({
-            method: 'get',
-            url: s3Url,
-            responseType: 'stream',
-            timeout: 60000
-        });
+        try {
+            const response = await axiosInstance({
+                method: 'get',
+                url: s3Url,
+                responseType: 'stream',
+                timeout: 60000,
+                retryCount: 0
+            });
 
-        const writer = fs.createWriteStream(inputTmp);
-        await new Promise((resolve, reject) => {
-            response.data.pipe(writer);
-            writer.on('finish', resolve);
-            writer.on('error', reject);
-        });
+            const writer = fs.createWriteStream(inputTmp);
+            await new Promise((resolve, reject) => {
+                response.data.pipe(writer);
+                writer.on('finish', resolve);
+                writer.on('error', reject);
+            });
+            logger.info('Video downloaded successfully');
+        } catch (downloadError) {
+            logger.error('Failed to download video:', downloadError);
+            throw new Error(`Video download failed: ${downloadError.message}`);
+        }
 
         // Get video information
         const videoInfo = await getVideoInfo(inputTmp);
@@ -169,7 +215,7 @@ async function processVideoToHLS(s3Url, savePath, reelId) {
 
         // Create master playlist
         const masterPlaylistPath = path.join(outputDir, 'master.m3u8');
-        await createMasterPlaylist(outputDir, masterPlaylistPath);
+        await createMasterPlaylist(outputDir, masterPlaylistPath, logger);
 
         // Delete any existing master.mpd file in S3
         try {
@@ -199,43 +245,124 @@ async function processVideoToHLS(s3Url, savePath, reelId) {
         };
 
     } catch (error) {
-        // update main server video status to failed
-        await axios.post(`${process.env.MAIN_SERVER_URL}/reels/internal/update`, {
-            reelId: reelId,
-            video_proccessed_status: 'failed'
-        });
+        processingError = error;
         logger.error('Error processing video:', error);
+        
+        // Enhanced error handling for status update
+        try {
+            const statusUpdateResponse = await axiosInstance({
+                method: 'post',
+                url: `${process.env.MAIN_SERVER_URL}/reels/internal/update`,
+                data: {
+                    reelId: reelId,
+                    video_proccessed_status: 'failed',
+                    error_message: error.message,
+                    error_details: {
+                        name: error.name,
+                        stack: error.stack,
+                        code: error.code
+                    }
+                },
+                timeout: 10000,
+                retryCount: 0
+            });
+            
+            logger.info('Status update sent successfully');
+        } catch (statusUpdateError) {
+            logger.error('Failed to update status:', statusUpdateError);
+        }
+        
         throw error;
     } finally {
         // Cleanup all temporary files and directories
         try {
-            logger.info('Cleaning up temporary files...');
+            console.log('\n=== Starting Cleanup Process ===');
+            logger.info('Starting cleanup process...');
+
+            // Check if files exist before attempting to delete
+            const inputFileExists = fs.existsSync(inputTmp);
+            const outputDirExists = fs.existsSync(outputDir);
+
+            console.log('File status before cleanup:');
+            console.log(`Input file exists: ${inputFileExists}`);
+            console.log(`Output directory exists: ${outputDirExists}`);
+
             // Remove input file
-            if (fs.existsSync(inputTmp)) {
-                await fs.unlink(inputTmp);
-                logger.info('Removed input file:', inputTmp);
+            if (inputFileExists) {
+                try {
+                    await fs.unlink(inputTmp);
+                    console.log('✅ Removed input file:', inputTmp);
+                    logger.info('Removed input file:', inputTmp);
+                } catch (inputFileError) {
+                    console.error('❌ Error removing input file:', inputFileError);
+                    logger.error('Error removing input file:', inputFileError);
+                }
+            } else {
+                console.log('ℹ️ Input file does not exist, skipping removal');
             }
             
             // Remove output directory and all its contents
-            if (fs.existsSync(outputDir)) {
-                await fs.remove(outputDir);
-                logger.info('Removed output directory:', outputDir);
+            if (outputDirExists) {
+                try {
+                    await fs.remove(outputDir);
+                    console.log('✅ Removed output directory:', outputDir);
+                    logger.info('Removed output directory:', outputDir);
+                } catch (outputDirError) {
+                    console.error('❌ Error removing output directory:', outputDirError);
+                    logger.error('Error removing output directory:', outputDirError);
+                }
+            } else {
+                console.log('ℹ️ Output directory does not exist, skipping removal');
             }
             
             // Remove temporary directory
-            tmpDir.removeCallback();
-            logger.info('Removed temporary directory:', tmpDir.name);
-            // update main server video status to completed
-            await axios.post(`${process.env.MAIN_SERVER_URL}/reels/internal/update`, {
-                reelId: reelId,
-                video_proccessed_status: 'done'
-            });
+            try {
+                tmpDir.removeCallback();
+                console.log('✅ Removed temporary directory:', tmpDir.name);
+                logger.info('Removed temporary directory:', tmpDir.name);
+            } catch (tmpDirError) {
+                console.error('❌ Error removing temporary directory:', tmpDirError);
+                logger.error('Error removing temporary directory:', tmpDirError);
+            }
+
+            // Update status to completed only if no error occurred
+            if (!processingError) {
+                try {
+                    const statusUpdateResponse = await axiosInstance({
+                        method: 'post',
+                        url: `${process.env.MAIN_SERVER_URL}/reels/internal/update`,
+                        data: {
+                            reelId: reelId,
+                            video_proccessed_status: 'done'
+                        },
+                        timeout: 10000,
+                        retryCount: 0
+                    });
+                    
+                    console.log('✅ Status update sent successfully');
+                    logger.info('Status update sent successfully');
+                } catch (statusUpdateError) {
+                    console.error('❌ Failed to update completion status:', statusUpdateError);
+                    logger.error('Failed to update completion status:', statusUpdateError);
+                }
+            }
+
+            console.log('=== Cleanup Process Completed ===\n');
         } catch (cleanupError) {
+            console.error('\n❌ Error during cleanup:', cleanupError);
+            console.error('Cleanup error details:', {
+                name: cleanupError.name,
+                message: cleanupError.message,
+                stack: cleanupError.stack,
+                code: cleanupError.code
+            });
+            
             logger.error('Error during cleanup:', cleanupError);
-            // update main server video status to failed
-            await axios.post(`${process.env.MAIN_SERVER_URL}/reels/internal/update`, {
-                reelId: reelId,
-                video_proccessed_status: 'failed'
+            logger.error('Cleanup error details:', {
+                name: cleanupError.name,
+                message: cleanupError.message,
+                stack: cleanupError.stack,
+                code: cleanupError.code
             });
         } finally {
             await logger.end();
@@ -243,44 +370,119 @@ async function processVideoToHLS(s3Url, savePath, reelId) {
     }
 }
 
-async function createMasterPlaylist(basePath, outputPath) {
-    const playlistContent = `#EXTM3U
+async function createMasterPlaylist(basePath, outputPath, logger) {
+    try {
+        console.log('\n=== Creating Master Playlist ===');
+        console.log(`Base Path: ${basePath}`);
+        console.log(`Output Path: ${outputPath}`);
+
+        const playlistContent = `#EXTM3U
 #EXT-X-VERSION:3
 ${QUALITY_CONFIGS.map(config => `#EXT-X-STREAM-INF:BANDWIDTH=${parseInt(config.videoBitrate) + parseInt(config.audioBitrate)},RESOLUTION=${config.maxHeight}x${config.maxHeight}
 ${config.name}/segments/playlist.m3u8`).join('\n')}`;
 
-    logger.info('Creating master playlist at:', outputPath);
-    logger.info('Playlist content:', playlistContent);
-    await fs.writeFile(outputPath, playlistContent);
+        console.log('\nPlaylist content:');
+        console.log(playlistContent);
+
+        await fs.writeFile(outputPath, playlistContent);
+        console.log('\n✅ Master playlist created successfully');
+        
+        if (logger) {
+            logger.info('Master playlist created at:', outputPath);
+            logger.info('Playlist content:', playlistContent);
+        }
+    } catch (error) {
+        console.error('\n❌ Error creating master playlist:', error);
+        if (logger) {
+            logger.error('Error creating master playlist:', error);
+        }
+        throw error;
+    }
 }
 
 async function uploadToS3(localPath, bucket, s3Path) {
-    // Upload all files recursively
-    const files = await fs.readdir(localPath, { recursive: true });
+    const logger = new Logger('s3-upload');
+    await logger.initialize();
     
-    for (const file of files) {
-        const localFilePath = path.join(localPath, file);
-        const stats = await fs.stat(localFilePath);
-        
-        if (stats.isFile()) {
-            const relativePath = path.relative(localPath, localFilePath);
-            const s3Key = path.join(s3Path, relativePath).replace(/\\/g, '/');
-            
-            const fileStream = fs.createReadStream(localFilePath);
-            
-            await new Upload({
-                client: s3,
-                params: {
-                    Bucket: bucket,
-                    Key: s3Key,
-                    Body: fileStream,
-                    ContentType: getContentType(file),
-                    ContentLength: stats.size
-                }
-            }).done();
-            
-            logger.info(`Uploaded: ${s3Key}`);
+    try {
+        console.log('\n=== Starting S3 Upload Process ===');
+        console.log(`Local Path: ${localPath}`);
+        console.log(`Bucket: ${bucket}`);
+        console.log(`S3 Path: ${s3Path}\n`);
+
+        // Verify AWS credentials
+        if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
+            throw new Error('AWS credentials are not configured');
         }
+
+        // Verify bucket exists
+        try {
+            await s3.headBucket({ Bucket: bucket });
+            console.log(`✅ Bucket ${bucket} exists and is accessible`);
+        } catch (error) {
+            console.error(`❌ Error accessing bucket ${bucket}:`, error);
+            throw new Error(`Cannot access bucket ${bucket}: ${error.message}`);
+        }
+
+        // Upload all files recursively
+        const files = await fs.readdir(localPath, { recursive: true });
+        console.log(`\n📁 Found ${files.length} files to upload:\n`);
+        
+        for (const file of files) {
+            const localFilePath = path.join(localPath, file);
+            const stats = await fs.stat(localFilePath);
+            
+            if (stats.isFile()) {
+                const relativePath = path.relative(localPath, localFilePath);
+                const s3Key = path.join(s3Path, relativePath).replace(/\\/g, '/');
+                
+                console.log(`\n📤 Uploading: ${file}`);
+                // console.log(`   Local: ${localFilePath}`);
+                // console.log(`   S3 Key: ${s3Key}`);
+                // console.log(`   Size: ${(stats.size / (1024 * 1024)).toFixed(2)} MB`);
+
+                try {
+                    const fileStream = fs.createReadStream(localFilePath);
+                    
+                    const upload = new Upload({
+                        client: s3,
+                        params: {
+                            Bucket: bucket,
+                            Key: s3Key,
+                            Body: fileStream,
+                            ContentType: getContentType(file),
+                            ContentLength: stats.size
+                        },
+                        queueSize: 4,
+                        partSize: 1024 * 1024 * 5,
+                        leavePartsOnError: false
+                    });
+
+                    // Monitor upload progress
+                    upload.on('httpUploadProgress', (progress) => {
+                        const percentage = Math.round((progress.loaded / progress.total) * 100);
+                        const loadedMB = (progress.loaded / (1024 * 1024)).toFixed(2);
+                        const totalMB = (progress.total / (1024 * 1024)).toFixed(2);
+                        process.stdout.write(`\r   Progress: ${percentage}% (${loadedMB}MB / ${totalMB}MB)`);
+                    });
+
+                    await upload.done();
+                    console.log(`\n✅ Successfully uploaded: ${s3Key}`);
+                } catch (uploadError) {
+                    console.error(`\n❌ Failed to upload ${file}:`, uploadError);
+                    throw new Error(`Failed to upload ${file}: ${uploadError.message}`);
+                }
+            }
+        }
+
+        console.log('\n=== Upload Process Completed ===\n');
+        logger.success('All files uploaded successfully');
+    } catch (error) {
+        console.error('\n❌ S3 upload process failed:', error);
+        logger.error('S3 upload process failed:', error);
+        throw error;
+    } finally {
+        await logger.end();
     }
 }
 
@@ -326,4 +528,4 @@ function getVideoInfo(filePath) {
     });
 }
 
-module.exports = { processVideoToHLS }; 
+export { processVideoToHLS }; 
