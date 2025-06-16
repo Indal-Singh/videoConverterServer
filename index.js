@@ -7,6 +7,7 @@ import videoQueue from './queue.js';
 import worker from './worker.js';
 import { S3 } from '@aws-sdk/client-s3';
 import { processVideoToHLS } from './hlsVideoProcessor.js';
+import { processVideoFromS3Url } from './videoProcessor.js';
 
 dotenv.config();
 
@@ -65,6 +66,30 @@ app.get('/aws/check', async (req, res) => {
         });
     }
 });
+
+app.post('/process-video', async (req, res) => {
+    try {
+      const { videoUrl } = req.body;
+      
+      if (!videoUrl) {
+        return res.status(400).json({ error: 'Video URL is required' });
+      }
+      
+      const processedUrl = await processVideoFromS3Url(videoUrl);
+      
+      return res.json({ 
+        success: true, 
+        originalUrl: videoUrl,
+        processedUrl: processedUrl 
+      });
+    } catch (error) {
+      console.error('Error in process-video route:', error);
+      return res.status(500).json({ 
+        error: 'Video processing failed', 
+        message: error.message 
+      });
+    }
+  });
 
 // Setup Bull Board
 const serverAdapter = new ExpressAdapter();
