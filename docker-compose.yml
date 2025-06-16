@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  video-processor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: video-processor
+    ports:
+      - "3020:3020"
+    environment:
+      - NODE_ENV=production
+      - REDIS_HOST=valkey
+      - REDIS_PORT=6379
+      - MAIN_SERVER_URL=${MAIN_SERVER_URL}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=${AWS_REGION}
+      - S3_BUCKET=${S3_BUCKET}
+    volumes:
+      - ./logs:/app/logs
+      - ./temp:/app/temp
+    depends_on:
+      - valkey
+    restart: unless-stopped
+    networks:
+      - video-network
+
+  valkey:
+    image: valkey/valkey:latest
+    container_name: valkey
+    command: valkey-server --port 6379
+    ports:
+      - "6379:6379"
+    volumes:
+      - valkey-data:/data
+    restart: unless-stopped
+    networks:
+      - video-network
+
+volumes:
+  valkey-data:
+    driver: local
+
+networks:
+  video-network:
+    driver: bridge 
