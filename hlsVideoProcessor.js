@@ -378,8 +378,11 @@ async function createMasterPlaylist(basePath, outputPath, logger) {
 
         const playlistContent = `#EXTM3U
 #EXT-X-VERSION:3
-${QUALITY_CONFIGS.map(config => `#EXT-X-STREAM-INF:BANDWIDTH=${parseInt(config.videoBitrate) + parseInt(config.audioBitrate)},RESOLUTION=${config.maxHeight}x${config.maxHeight}
-${config.name}/segments/playlist.m3u8`).join('\n')}`;
+${QUALITY_CONFIGS.map(config => {
+    const bandwidth = (parseInt(config.videoBitrate) + parseInt(config.audioBitrate)) * 1000;
+    return `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${config.maxHeight}x${config.maxHeight}
+${config.name}/segments/playlist.m3u8`;
+}).join('\n')}`;
 
         console.log('\nPlaylist content:');
         console.log(playlistContent);
